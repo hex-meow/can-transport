@@ -1,0 +1,33 @@
+[package]
+name = "can-transport"
+version = "0.1.0"
+edition = "2021"
+description = "Async, cross-platform CAN / CAN-FD transport abstraction with per-subscriber filtering."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kisonhe/base-backend"
+keywords = ["can", "canbus", "canfd", "async", "embedded"]
+categories = ["embedded", "asynchronous", "network-programming"]
+
+[dependencies]
+async-trait = "0.1"
+thiserror = "1"
+log = "0.4"
+
+# Optional backends
+socketcan = { version = "3.5", features = ["tokio"], optional = true }
+tokio = { version = "1", features = ["sync", "rt", "macros"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Linux SocketCAN backend (CAN + CAN-FD). Pulls in tokio.
+socketcan = ["dep:socketcan", "dep:tokio", "dep:futures-util"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
+anyhow = "1"
+
+[[example]]
+name = "monitor"
+required-features = ["socketcan"]
