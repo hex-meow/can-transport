@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Async, cross-platform CAN / CAN-FD transport abstraction with per-subscriber filtering."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/kisonhe/base-backend"
+repository = "https://github.com/hexmecha/can-transport.git"
+authors = ["KisonHe <kisonhepenpal@gmail.com>"]
 keywords = ["can", "canbus", "canfd", "async", "embedded"]
 categories = ["embedded", "asynchronous", "network-programming"]
 
