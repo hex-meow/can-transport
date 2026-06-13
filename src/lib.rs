@@ -7,6 +7,8 @@
 //!
 //! Backends:
 //! - `socketcan` (feature) — Linux SocketCAN, CAN 2.0 and CAN-FD.
+//! - `gs_usb` (feature) — gs_usb / candleLight over USB, for Windows, macOS,
+//!   and Linux without the kernel driver. CAN 2.0 and CAN-FD.
 //!
 //! See the `examples/` directory for end-to-end usage with SocketCAN.
 
@@ -22,3 +24,6 @@ pub use frame::{CanFrame, CanId, FrameKind, MAX_DLEN};
 
 #[cfg(feature = "socketcan")]
 pub mod socketcan;
+
+#[cfg(feature = "gs_usb")]
+pub mod gs_usb;

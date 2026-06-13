@@ -18,11 +18,16 @@ log = "0.4"
 socketcan = { version = "3.5", features = ["tokio"], optional = true }
 tokio = { version = "1", features = ["sync", "rt", "macros"], optional = true }
 futures-util = { version = "0.3", optional = true }
+# gs_usb backend (Windows / macOS / Linux without kernel driver). Pure-Rust USB.
+nusb = { version = "0.2", features = ["tokio"], optional = true }
 
 [features]
 default = []
 # Linux SocketCAN backend (CAN + CAN-FD). Pulls in tokio.
 socketcan = ["dep:socketcan", "dep:tokio", "dep:futures-util"]
+# gs_usb (candleLight) userspace backend, CAN + CAN-FD. Works on Windows,
+# macOS, and Linux (detaches the kernel gs_usb driver). Pulls in tokio.
+gs_usb = ["dep:nusb", "dep:tokio", "dep:futures-util"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -32,3 +37,7 @@ anyhow = "1"
 [[example]]
 name = "monitor"
 required-features = ["socketcan"]
+
+[[example]]
+name = "gs_usb_monitor"
+required-features = ["gs_usb"]
