@@ -15,8 +15,15 @@ use can_transport::{CanBus, CanFilter};
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    println!("opening gs_usb device (CAN-FD, 1M/5M)...");
-    let bus = GsUsbBus::open(GsUsbConfig::fd_1m_5m()).await?;
+    // Optional channel index for multi-channel adapters (default 0).
+    let channel: u16 = std::env::args()
+        .nth(1)
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(0);
+
+    println!("opening gs_usb device channel {channel} (CAN-FD, 1M/5M)...");
+    let bus = GsUsbBus::open(GsUsbConfig::fd_1m_5m().with_channel(channel)).await?;
     println!("opened: {:?}", bus.capabilities());
 
     let mut rx = bus.subscribe(CanFilter::pass_all_standard()).await?;

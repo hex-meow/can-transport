@@ -210,6 +210,12 @@ impl GsUsbConfig {
             loopback: false,
         }
     }
+
+    /// Select which channel of a multi-channel adapter to use (`can0` = 0).
+    pub fn with_channel(mut self, channel: u16) -> Self {
+        self.channel = channel;
+        self
+    }
 }
 
 // ---------- fan-out registry (mirrors the SocketCAN backend) ----------
@@ -327,7 +333,7 @@ impl GsUsbBus {
             .map_err(CanIoError::backend)?;
 
         let registry = Arc::new(Registry::new());
-        let reader = tokio::spawn(reader_task(in_ep, registry.clone()));
+        let reader = tokio::spawn(reader_task(in_ep, registry.clone(), chan as u8));
 
         Ok(Self {
             out_ep: Mutex::new(out_ep),
@@ -373,7 +379,11 @@ async fn control_out(
         .map_err(CanIoError::backend)
 }
 
-async fn reader_task(mut in_ep: nusb::Endpoint<Bulk, In>, registry: Arc<Registry>) {
+async fn reader_task(
+    mut in_ep: nusb::Endpoint<Bulk, In>,
+    registry: Arc<Registry>,
+    channel: u8,
+) {
     for _ in 0..IN_FLIGHT {
         in_ep.submit(Buffer::new(READ_LEN));
     }
@@ -385,7 +395,7 @@ async fn reader_task(mut in_ep: nusb::Endpoint<Bulk, In>, registry: Arc<Registry
             return;
         }
         let bytes = &completion.buffer[..completion.actual_len];
-        if let Some(frame) = parse_host_frame(bytes) {
+        if let Some(frame) = parse_host_frame(bytes, channel) {
             dispatch(&registry, frame).await;
         }
         in_ep.submit(Buffer::new(READ_LEN));
@@ -409,14 +419,19 @@ async fn dispatch(registry: &Registry, frame: CanFrame) {
 }
 
 /// Parse one `gs_host_frame` off the bulk-IN endpoint. Returns `None` for our
-/// own transmit echoes, CAN error frames, and runts.
-fn parse_host_frame(buf: &[u8]) -> Option<CanFrame> {
+/// own transmit echoes, frames on a different channel, CAN error frames, and
+/// runts.
+fn parse_host_frame(buf: &[u8], expected_channel: u8) -> Option<CanFrame> {
     if buf.len() < HDR_LEN {
         return None;
     }
     let echo_id = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if echo_id != ECHO_ID_RX {
         // Echo of one of our own sends (a TX completion ack); not a received frame.
+        return None;
+    }
+    // On a multi-channel adapter, ignore frames belonging to other channels.
+    if buf[9] != expected_channel {
         return None;
     }
     let raw_id = u32::from_le_bytes(buf[4..8].try_into().unwrap());
@@ -611,7 +626,19 @@ mod tests {
     fn rx_echo_frames_are_skipped() {
         let mut buf = vec![0u8; HDR_LEN + 8];
         buf[0..4].copy_from_slice(&7u32.to_le_bytes()); // echo_id != RX sentinel
-        assert!(parse_host_frame(&buf).is_none());
+        assert!(parse_host_frame(&buf, 0).is_none());
+    }
+
+    #[test]
+    fn rx_other_channel_is_skipped() {
+        let mut buf = vec![0u8; HDR_LEN + 8];
+        buf[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
+        buf[4..8].copy_from_slice(&0x123u32.to_le_bytes());
+        buf[9] = 1; // channel 1
+        // A bus listening on channel 0 must not see channel 1's traffic.
+        assert!(parse_host_frame(&buf, 0).is_none());
+        // ...but a channel-1 bus does.
+        assert!(parse_host_frame(&buf, 1).is_some());
     }
 
     #[test]
@@ -621,7 +648,7 @@ mod tests {
         buf[4..8].copy_from_slice(&0x123u32.to_le_bytes());
         buf[8] = 3; // dlc
         buf[HDR_LEN..HDR_LEN + 3].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
-        let f = parse_host_frame(&buf).unwrap();
+        let f = parse_host_frame(&buf, 0).unwrap();
         assert_eq!(f.id(), CanId::Standard(0x123));
         assert_eq!(f.data(), &[0xAA, 0xBB, 0xCC]);
         assert!(!f.is_fd());
@@ -634,7 +661,7 @@ mod tests {
         buf[4..8].copy_from_slice(&(0x1ABCDEF | CAN_EFF_FLAG).to_le_bytes());
         buf[8] = 10; // FD dlc 10 -> 16 bytes
         buf[10] = FLAG_FD | FLAG_BRS;
-        let f = parse_host_frame(&buf).unwrap();
+        let f = parse_host_frame(&buf, 0).unwrap();
         assert_eq!(f.id(), CanId::Extended(0x1ABCDEF));
         assert_eq!(f.data().len(), 16);
         assert!(f.is_fd());
@@ -649,7 +676,7 @@ mod tests {
         let mut bytes = encode_host_frame(&orig, ECHO_ID_RX, true, 0).unwrap();
         // encode uses a real echo id on the wire; force RX sentinel to parse back.
         bytes[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
-        let back = parse_host_frame(&bytes).unwrap();
+        let back = parse_host_frame(&bytes, 0).unwrap();
         assert_eq!(back.id(), orig.id());
         assert!(back.is_fd());
         assert!(back.brs());

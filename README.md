@@ -97,6 +97,20 @@ For other clocks/rates, set the `nominal` / `data` `GsTiming` fields
 yourself. The kernel's `ip -details link show can0` prints the segment
 values it computed, which you can copy verbatim.
 
+### Multi-channel adapters
+
+For an adapter with more than one CAN channel, select the channel with
+`GsUsbConfig::with_channel` (default 0). Each `GsUsbBus` drives one
+channel; frames belonging to other channels are filtered out on receive.
+
+```rust
+let bus = GsUsbBus::open(GsUsbConfig::fd_1m_5m().with_channel(1)).await?;
+```
+
+Higher-level tools in this workspace expose this as a `gs_usb<channel>`
+interface string — `gs_usb` or `gs_usb0` for channel 0, `gs_usb1` for
+channel 1, and so on.
+
 ### Per-platform driver story
 
 | Platform | What's needed | sudo / admin? |

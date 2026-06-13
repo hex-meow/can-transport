@@ -1,6 +1,6 @@
 [package]
 name = "can-transport"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Async, cross-platform CAN / CAN-FD transport abstraction with per-subscriber filtering."
 license = "MIT OR Apache-2.0"
