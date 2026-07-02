@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.2 (unreleased)
+## 0.1.2
 
 Additive API, no behavior change for existing code paths.
 
