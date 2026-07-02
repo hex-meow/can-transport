@@ -70,13 +70,34 @@ pub enum FrameKind {
 /// Backed by a fixed-size buffer so the type is `Copy`-friendly and
 /// allocation-free, which matters when fan-out happens on every received
 /// frame. The actual payload length is stored separately in `len`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Received frames may carry a hardware timestamp (see [`Self::timestamp_us`])
+/// when the backend supports and enables it; constructed frames never do.
+#[derive(Debug, Clone, Copy)]
 pub struct CanFrame {
     id: CanId,
     kind: FrameKind,
     len: u8,
     data: [u8; MAX_DLEN],
+    /// Backend-provided receive timestamp, µs. `None` = not available.
+    ts_us: Option<u64>,
 }
+
+/// Equality is over the frame *content* (id, kind, payload) — the receive
+/// timestamp is deliberately excluded, so a constructed frame compares equal
+/// to the same frame received off the wire.
+impl PartialEq for CanFrame {
+    fn eq(&self, other: &Self) -> bool {
+        // Bytes beyond `len` are always zeroed by the constructors, so a
+        // full-array compare is equivalent to comparing the payloads.
+        self.id == other.id
+            && self.kind == other.kind
+            && self.len == other.len
+            && self.data == other.data
+    }
+}
+
+impl Eq for CanFrame {}
 
 impl CanFrame {
     /// Build a classic CAN data frame (≤ 8 bytes).
@@ -94,6 +115,7 @@ impl CanFrame {
             kind: FrameKind::Data,
             len: payload.len() as u8,
             data,
+            ts_us: None,
         })
     }
 
@@ -116,6 +138,7 @@ impl CanFrame {
             kind: FrameKind::Fd { brs },
             len: payload.len() as u8,
             data,
+            ts_us: None,
         })
     }
 
@@ -132,6 +155,7 @@ impl CanFrame {
             kind: FrameKind::Remote,
             len: dlc,
             data: [0u8; MAX_DLEN],
+            ts_us: None,
         })
     }
 
@@ -168,6 +192,24 @@ impl CanFrame {
     pub fn brs(&self) -> bool {
         matches!(self.kind, FrameKind::Fd { brs: true })
     }
+
+    /// Receive timestamp in microseconds, if the backend captured one.
+    ///
+    /// The epoch is backend-defined (e.g. for gs_usb it is the device's
+    /// free-running clock, unwrapped to a monotonic 64-bit count by the
+    /// backend); only *differences* between timestamps from the same bus are
+    /// meaningful. `None` on constructed frames and on backends without
+    /// timestamp support.
+    pub fn timestamp_us(&self) -> Option<u64> {
+        self.ts_us
+    }
+
+    /// Return a copy of this frame carrying a receive timestamp. Intended for
+    /// backend implementations stamping frames on arrival.
+    pub fn with_timestamp_us(mut self, us: u64) -> Self {
+        self.ts_us = Some(us);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +236,22 @@ mod tests {
     #[test]
     fn classic_rejects_over_8() {
         assert!(CanFrame::new_data(0x100u16, &[0; 9]).is_err());
+    }
+
+    #[test]
+    fn timestamp_default_none_and_round_trip() {
+        let f = CanFrame::new_data(0x123u16, &[1, 2]).unwrap();
+        assert_eq!(f.timestamp_us(), None);
+        let g = f.with_timestamp_us(42);
+        assert_eq!(g.timestamp_us(), Some(42));
+        // Payload untouched by stamping.
+        assert_eq!(g.data(), &[1, 2]);
+    }
+
+    #[test]
+    fn equality_ignores_timestamp() {
+        let a = CanFrame::new_data(0x123u16, &[1, 2, 3]).unwrap();
+        let b = a.with_timestamp_us(999);
+        assert_eq!(a, b);
     }
 }

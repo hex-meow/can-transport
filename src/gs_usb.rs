@@ -40,11 +40,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nusb::transfer::{Buffer, Bulk, ControlOut, ControlType, In, Out, Recipient};
+use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient};
 use nusb::{Device, Interface};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::bus::{CanBus, CanCapabilities, CanRx};
+use crate::bus::{CanBus, CanBusState, CanCapabilities, CanControllerState, CanRx};
 use crate::error::CanIoError;
 use crate::filter::CanFilter;
 use crate::frame::{CanFrame, CanId, FrameKind, MAX_DLEN};
@@ -73,14 +73,26 @@ const SUBSCRIBER_QUEUE: usize = 256;
 const BREQ_HOST_FORMAT: u8 = 0;
 const BREQ_BITTIMING: u8 = 1;
 const BREQ_MODE: u8 = 2;
+const BREQ_BT_CONST: u8 = 4;
 const BREQ_DATA_BITTIMING: u8 = 10;
+const BREQ_GET_STATE: u8 = 14;
 
 // Device mode words.
 const MODE_START: u32 = 1;
 // Mode feature-enable flags.
 const MODE_LISTEN_ONLY: u32 = 1 << 0;
 const MODE_LOOP_BACK: u32 = 1 << 1;
+const MODE_HW_TIMESTAMP: u32 = 1 << 4;
 const MODE_FD: u32 = 1 << 8;
+
+// Device feature bits (first u32 of the BT_CONST reply).
+const FEATURE_HW_TIMESTAMP: u32 = 1 << 4;
+const FEATURE_GET_STATE: u32 = 1 << 13;
+
+/// BT_CONST reply length: feature + fclk_can + 8 timing-limit words.
+const BT_CONST_LEN: usize = 40;
+/// GET_STATE reply: `{ state: u32, rxerr: u32, txerr: u32 }`.
+const GET_STATE_LEN: usize = 12;
 
 // Per-frame flags (`gs_host_frame.flags`).
 const FLAG_FD: u8 = 1 << 1;
@@ -163,6 +175,11 @@ pub struct GsUsbConfig {
     pub listen_only: bool,
     /// Internal loopback (for self-test without a bus).
     pub loopback: bool,
+    /// Ask the device to stamp received frames with its hardware clock
+    /// (µs, surfaced via [`CanFrame::timestamp_us`]). Requires firmware
+    /// support (`GS_CAN_FEATURE_HW_TIMESTAMP`); silently disabled with a
+    /// warning if the device doesn't advertise it.
+    pub hw_timestamp: bool,
 }
 
 impl GsUsbConfig {
@@ -181,6 +198,7 @@ impl GsUsbConfig {
             data: None,
             listen_only: false,
             loopback: false,
+            hw_timestamp: false,
         }
     }
 
@@ -208,12 +226,20 @@ impl GsUsbConfig {
             }),
             listen_only: false,
             loopback: false,
+            hw_timestamp: false,
         }
     }
 
     /// Select which channel of a multi-channel adapter to use (`can0` = 0).
     pub fn with_channel(mut self, channel: u16) -> Self {
         self.channel = channel;
+        self
+    }
+
+    /// Request device hardware timestamps on received frames (if the
+    /// firmware supports them).
+    pub fn with_hw_timestamp(mut self, on: bool) -> Self {
+        self.hw_timestamp = on;
         self
     }
 }
@@ -252,8 +278,13 @@ pub struct GsUsbBus {
     echo: AtomicU32,
     fd: bool,
     channel: u16,
+    /// Device feature word from BT_CONST (0 if the probe failed).
+    features: u32,
+    /// Hardware timestamps were requested *and* the device supports them.
+    hw_ts: bool,
     // Kept alive so the device/interface stay claimed for the bus's lifetime.
-    _interface: Interface,
+    // Also used for on-demand control requests (GET_STATE).
+    interface: Interface,
     _device: Device,
 }
 
@@ -302,6 +333,24 @@ impl GsUsbBus {
         // 1. Tell the device our byte order (little-endian magic 0x0000beef).
         control_out(&interface, BREQ_HOST_FORMAT, 1, &0x0000_beefu32.to_le_bytes()).await?;
 
+        // 1b. Probe the device feature word (first u32 of BT_CONST). Gates
+        // hardware timestamps and GET_STATE below.
+        let features = match control_in(&interface, BREQ_BT_CONST, chan, BT_CONST_LEN).await {
+            Ok(buf) if buf.len() >= 4 => u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            Ok(_) | Err(_) => {
+                log::warn!("gs_usb: BT_CONST probe failed; assuming no optional features");
+                0
+            }
+        };
+
+        let hw_ts = config.hw_timestamp && (features & FEATURE_HW_TIMESTAMP != 0);
+        if config.hw_timestamp && !hw_ts {
+            log::warn!(
+                "gs_usb: hardware timestamps requested but the device does not \
+                 advertise GS_CAN_FEATURE_HW_TIMESTAMP; falling back to none"
+            );
+        }
+
         // 2. Bit timing (nominal, and data phase for FD).
         control_out(&interface, BREQ_BITTIMING, chan, &config.nominal.to_bytes()).await?;
         if config.fd {
@@ -320,6 +369,9 @@ impl GsUsbBus {
         if config.loopback {
             flags |= MODE_LOOP_BACK;
         }
+        if hw_ts {
+            flags |= MODE_HW_TIMESTAMP;
+        }
         let mut mode = [0u8; 8];
         mode[0..4].copy_from_slice(&MODE_START.to_le_bytes());
         mode[4..8].copy_from_slice(&flags.to_le_bytes());
@@ -333,7 +385,7 @@ impl GsUsbBus {
             .map_err(CanIoError::backend)?;
 
         let registry = Arc::new(Registry::new());
-        let reader = tokio::spawn(reader_task(in_ep, registry.clone(), chan as u8));
+        let reader = tokio::spawn(reader_task(in_ep, registry.clone(), chan as u8, hw_ts));
 
         Ok(Self {
             out_ep: Mutex::new(out_ep),
@@ -342,9 +394,23 @@ impl GsUsbBus {
             echo: AtomicU32::new(0),
             fd: config.fd,
             channel: chan,
-            _interface: interface,
+            features,
+            hw_ts,
+            interface,
             _device: device,
         })
+    }
+
+    /// `true` when the device is stamping received frames with its hardware
+    /// clock (requested via [`GsUsbConfig::hw_timestamp`] and supported by
+    /// the firmware).
+    pub fn hw_timestamps_active(&self) -> bool {
+        self.hw_ts
+    }
+
+    /// Raw device feature word from BT_CONST (`GS_CAN_FEATURE_*` bits).
+    pub fn device_features(&self) -> u32 {
+        self.features
     }
 }
 
@@ -379,14 +445,45 @@ async fn control_out(
         .map_err(CanIoError::backend)
 }
 
+/// Issue a vendor control-IN to interface 0, reading up to `len` bytes.
+async fn control_in(
+    iface: &Interface,
+    request: u8,
+    value: u16,
+    len: usize,
+) -> Result<Vec<u8>, CanIoError> {
+    iface
+        .control_in(
+            ControlIn {
+                control_type: ControlType::Vendor,
+                recipient: Recipient::Interface,
+                request,
+                value,
+                index: 0, // interface number
+                length: len as u16,
+            },
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .map_err(CanIoError::backend)
+}
+
 async fn reader_task(
     mut in_ep: nusb::Endpoint<Bulk, In>,
     registry: Arc<Registry>,
     channel: u8,
+    hw_ts: bool,
 ) {
     for _ in 0..IN_FLIGHT {
         in_ep.submit(Buffer::new(READ_LEN));
     }
+    // The device timestamp is a free-running 32-bit µs counter that wraps
+    // every ~71.6 minutes; unwrap it into a monotonic u64. Frames arrive in
+    // order on this single task, so a raw value smaller than the previous
+    // one means exactly one wrap (a >71-minute silent gap on this channel
+    // would be missed — acceptable, only deltas are meaningful).
+    let mut ts_last: u32 = 0;
+    let mut ts_epoch: u64 = 0;
     loop {
         let completion = in_ep.next_complete().await;
         if let Err(e) = completion.status {
@@ -395,11 +492,29 @@ async fn reader_task(
             return;
         }
         let bytes = &completion.buffer[..completion.actual_len];
-        if let Some(frame) = parse_host_frame(bytes, channel) {
+        if let Some((frame, raw_ts)) = parse_host_frame(bytes, channel, hw_ts) {
+            let frame = match raw_ts {
+                Some(raw) => frame.with_timestamp_us(unwrap_ts(&mut ts_last, &mut ts_epoch, raw)),
+                None => frame,
+            };
             dispatch(&registry, frame).await;
         }
         in_ep.submit(Buffer::new(READ_LEN));
     }
+}
+
+/// Unwrap the device's free-running 32-bit µs counter into a monotonic u64.
+/// A raw value below the previous one means the counter wrapped (every
+/// ~71.6 min); gaps longer than one full wrap on a silent channel are
+/// undetectable and fold into one wrap. Note the tracker only sees *received*
+/// frames — TX echoes and error frames are dropped before the timestamp is
+/// parsed, so an RX-silent (but transmitting) stretch >71.6 min also folds.
+fn unwrap_ts(ts_last: &mut u32, ts_epoch: &mut u64, raw: u32) -> u64 {
+    if raw < *ts_last {
+        *ts_epoch += 1u64 << 32;
+    }
+    *ts_last = raw;
+    *ts_epoch | raw as u64
 }
 
 async fn dispatch(registry: &Registry, frame: CanFrame) {
@@ -420,8 +535,14 @@ async fn dispatch(registry: &Registry, frame: CanFrame) {
 
 /// Parse one `gs_host_frame` off the bulk-IN endpoint. Returns `None` for our
 /// own transmit echoes, frames on a different channel, CAN error frames, and
-/// runts.
-fn parse_host_frame(buf: &[u8], expected_channel: u8) -> Option<CanFrame> {
+/// runts. When `hw_ts` is set, also extracts the device timestamp: the wire
+/// layout is per-frame — header(12) + data arm (64 for FD frames, 8 for
+/// classic/RTR) + a trailing `u32` µs counter.
+fn parse_host_frame(
+    buf: &[u8],
+    expected_channel: u8,
+    hw_ts: bool,
+) -> Option<(CanFrame, Option<u32>)> {
     if buf.len() < HDR_LEN {
         return None;
     }
@@ -450,11 +571,25 @@ fn parse_host_frame(buf: &[u8], expected_channel: u8) -> Option<CanFrame> {
         CanId::Standard((raw_id & CAN_SFF_MASK) as u16)
     };
 
+    let is_fd = flags & FLAG_FD != 0;
+    // The device timestamp sits after the frame's data arm.
+    let ts = if hw_ts {
+        let arm = if is_fd { MAX_DLEN } else { 8 };
+        let off = HDR_LEN + arm;
+        if buf.len() >= off + 4 {
+            Some(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()))
+        } else {
+            log::debug!("gs_usb: hw timestamp expected but frame too short ({})", buf.len());
+            None
+        }
+    } else {
+        None
+    };
+
     if raw_id & CAN_RTR_FLAG != 0 {
-        return CanFrame::new_remote(id, dlc.min(8)).ok();
+        return CanFrame::new_remote(id, dlc.min(8)).ok().map(|f| (f, ts));
     }
 
-    let is_fd = flags & FLAG_FD != 0;
     let len = if is_fd {
         fd_dlc2len(dlc)
     } else {
@@ -465,11 +600,12 @@ fn parse_host_frame(buf: &[u8], expected_channel: u8) -> Option<CanFrame> {
     }
     let payload = &buf[HDR_LEN..HDR_LEN + len];
 
-    if is_fd {
+    let frame = if is_fd {
         CanFrame::new_fd(id, payload, flags & FLAG_BRS != 0).ok()
     } else {
         CanFrame::new_data(id, payload).ok()
-    }
+    };
+    frame.map(|f| (f, ts))
 }
 
 #[async_trait]
@@ -512,6 +648,40 @@ impl CanBus for GsUsbBus {
             fd: self.fd,
             max_dlen: if self.fd { MAX_DLEN } else { 8 },
         }
+    }
+
+    async fn bus_state(&self) -> Result<Option<CanBusState>, CanIoError> {
+        if self.features & FEATURE_GET_STATE == 0 {
+            // Firmware without GET_STATE — health is simply unknown.
+            return Ok(None);
+        }
+        let buf = control_in(&self.interface, BREQ_GET_STATE, self.channel, GET_STATE_LEN).await?;
+        if buf.len() < GET_STATE_LEN {
+            return Err(CanIoError::backend(ProtocolError(
+                "short GET_STATE reply from device",
+            )));
+        }
+        // struct gs_device_state { u32 state; u32 rxerr; u32 txerr } (LE).
+        let state = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let rxerr = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let txerr = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+        let state = match state {
+            0 => Some(CanControllerState::ErrorActive),
+            1 => Some(CanControllerState::ErrorWarning),
+            2 => Some(CanControllerState::ErrorPassive),
+            3 => Some(CanControllerState::BusOff),
+            4 => Some(CanControllerState::Stopped),
+            5 => Some(CanControllerState::Sleeping),
+            other => {
+                log::debug!("gs_usb: unknown gs_can_state {other}");
+                None
+            }
+        };
+        Ok(Some(CanBusState {
+            state,
+            tx_errors: Some(txerr.min(u16::MAX as u32) as u16),
+            rx_errors: Some(rxerr.min(u16::MAX as u32) as u16),
+        }))
     }
 }
 
@@ -608,6 +778,17 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+#[derive(Debug)]
+struct ProtocolError(&'static str);
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,7 +807,7 @@ mod tests {
     fn rx_echo_frames_are_skipped() {
         let mut buf = vec![0u8; HDR_LEN + 8];
         buf[0..4].copy_from_slice(&7u32.to_le_bytes()); // echo_id != RX sentinel
-        assert!(parse_host_frame(&buf, 0).is_none());
+        assert!(parse_host_frame(&buf, 0, false).is_none());
     }
 
     #[test]
@@ -636,9 +817,9 @@ mod tests {
         buf[4..8].copy_from_slice(&0x123u32.to_le_bytes());
         buf[9] = 1; // channel 1
         // A bus listening on channel 0 must not see channel 1's traffic.
-        assert!(parse_host_frame(&buf, 0).is_none());
+        assert!(parse_host_frame(&buf, 0, false).is_none());
         // ...but a channel-1 bus does.
-        assert!(parse_host_frame(&buf, 1).is_some());
+        assert!(parse_host_frame(&buf, 1, false).is_some());
     }
 
     #[test]
@@ -648,10 +829,11 @@ mod tests {
         buf[4..8].copy_from_slice(&0x123u32.to_le_bytes());
         buf[8] = 3; // dlc
         buf[HDR_LEN..HDR_LEN + 3].copy_from_slice(&[0xAA, 0xBB, 0xCC]);
-        let f = parse_host_frame(&buf, 0).unwrap();
+        let (f, ts) = parse_host_frame(&buf, 0, false).unwrap();
         assert_eq!(f.id(), CanId::Standard(0x123));
         assert_eq!(f.data(), &[0xAA, 0xBB, 0xCC]);
         assert!(!f.is_fd());
+        assert_eq!(ts, None);
     }
 
     #[test]
@@ -661,7 +843,7 @@ mod tests {
         buf[4..8].copy_from_slice(&(0x1ABCDEF | CAN_EFF_FLAG).to_le_bytes());
         buf[8] = 10; // FD dlc 10 -> 16 bytes
         buf[10] = FLAG_FD | FLAG_BRS;
-        let f = parse_host_frame(&buf, 0).unwrap();
+        let (f, _) = parse_host_frame(&buf, 0, false).unwrap();
         assert_eq!(f.id(), CanId::Extended(0x1ABCDEF));
         assert_eq!(f.data().len(), 16);
         assert!(f.is_fd());
@@ -676,12 +858,77 @@ mod tests {
         let mut bytes = encode_host_frame(&orig, ECHO_ID_RX, true, 0).unwrap();
         // encode uses a real echo id on the wire; force RX sentinel to parse back.
         bytes[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
-        let back = parse_host_frame(&bytes, 0).unwrap();
+        let (back, _) = parse_host_frame(&bytes, 0, false).unwrap();
         assert_eq!(back.id(), orig.id());
         assert!(back.is_fd());
         assert!(back.brs());
         assert_eq!(back.data().len(), 16);
         assert_eq!(&back.data()[..13], payload.as_slice());
         assert_eq!(&back.data()[13..], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn rx_classic_frame_with_hw_timestamp() {
+        // header(12) + classic arm (8) + u32 ts.
+        let mut buf = vec![0u8; HDR_LEN + 8 + 4];
+        buf[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
+        buf[4..8].copy_from_slice(&0x123u32.to_le_bytes());
+        buf[8] = 2;
+        buf[HDR_LEN..HDR_LEN + 2].copy_from_slice(&[0x11, 0x22]);
+        buf[HDR_LEN + 8..HDR_LEN + 12].copy_from_slice(&123_456u32.to_le_bytes());
+        let (f, ts) = parse_host_frame(&buf, 0, true).unwrap();
+        assert_eq!(f.data(), &[0x11, 0x22]);
+        assert_eq!(ts, Some(123_456));
+    }
+
+    #[test]
+    fn rx_fd_frame_with_hw_timestamp() {
+        // header(12) + FD arm (64) + u32 ts.
+        let mut buf = vec![0u8; HDR_LEN + 64 + 4];
+        buf[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
+        buf[4..8].copy_from_slice(&0x321u32.to_le_bytes());
+        buf[8] = 9; // FD dlc 9 -> 12 bytes
+        buf[10] = FLAG_FD;
+        buf[HDR_LEN + 64..HDR_LEN + 68].copy_from_slice(&777u32.to_le_bytes());
+        let (f, ts) = parse_host_frame(&buf, 0, true).unwrap();
+        assert!(f.is_fd());
+        assert_eq!(f.data().len(), 12);
+        assert_eq!(ts, Some(777));
+    }
+
+    #[test]
+    fn rx_rtr_frame_with_hw_timestamp() {
+        // RTR uses the classic arm: header(12) + 8 + u32 ts.
+        let mut buf = vec![0u8; HDR_LEN + 8 + 4];
+        buf[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
+        buf[4..8].copy_from_slice(&(0x701u32 | CAN_RTR_FLAG).to_le_bytes());
+        buf[8] = 1;
+        buf[HDR_LEN + 8..HDR_LEN + 12].copy_from_slice(&42u32.to_le_bytes());
+        let (f, ts) = parse_host_frame(&buf, 0, true).unwrap();
+        assert!(f.is_remote());
+        assert_eq!(f.dlc(), 1);
+        assert_eq!(ts, Some(42));
+    }
+
+    #[test]
+    fn hw_timestamp_missing_bytes_degrades_to_none() {
+        // hw_ts on, but no trailing u32 — frame still parses, ts is None.
+        let mut buf = vec![0u8; HDR_LEN + 8];
+        buf[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
+        buf[4..8].copy_from_slice(&0x123u32.to_le_bytes());
+        buf[8] = 1;
+        let (_, ts) = parse_host_frame(&buf, 0, true).unwrap();
+        assert_eq!(ts, None);
+    }
+
+    #[test]
+    fn ts_unwrap_handles_32bit_wrap() {
+        let (mut last, mut epoch) = (0u32, 0u64);
+        assert_eq!(unwrap_ts(&mut last, &mut epoch, 100), 100);
+        assert_eq!(unwrap_ts(&mut last, &mut epoch, 4_000_000_000), 4_000_000_000);
+        // Counter wrapped: 5 < 4e9 → next epoch.
+        assert_eq!(unwrap_ts(&mut last, &mut epoch, 5), (1u64 << 32) | 5);
+        // Monotonic across the wrap.
+        assert!(unwrap_ts(&mut last, &mut epoch, 6) > 4_000_000_000);
     }
 }

@@ -28,7 +28,7 @@ use socketcan::{
 };
 use tokio::sync::{mpsc, Mutex};
 
-use crate::bus::{CanBus, CanCapabilities, CanRx};
+use crate::bus::{CanBus, CanBusState, CanCapabilities, CanControllerState, CanRx};
 use crate::error::CanIoError;
 use crate::filter::CanFilter;
 use crate::frame::{CanFrame, CanId, FrameKind, MAX_DLEN};
@@ -181,6 +181,34 @@ impl CanBus for SocketCanBus {
             fd: true,
             max_dlen: MAX_DLEN,
         }
+    }
+
+    async fn bus_state(&self) -> Result<Option<CanBusState>, CanIoError> {
+        let iface = self.iface.clone();
+        // Netlink queries are blocking syscalls; keep them off the reactor.
+        let state = tokio::task::spawn_blocking(move || {
+            let nl = ::socketcan::nl::CanInterface::open(&iface).map_err(CanIoError::backend)?;
+            // Both are Ok(None) when the netdev exposes no CAN netlink params
+            // (e.g. vcan or a non-CAN interface) — surface that as unknown. A
+            // down *physical* CAN device reports Some(Stopped) instead.
+            let state = nl.state().map_err(CanIoError::backend)?;
+            let berr = nl.berr_counter().map_err(CanIoError::backend)?;
+            Ok::<CanBusState, CanIoError>(CanBusState {
+                state: state.map(|s| match s {
+                    ::socketcan::nl::CanState::ErrorActive => CanControllerState::ErrorActive,
+                    ::socketcan::nl::CanState::ErrorWarning => CanControllerState::ErrorWarning,
+                    ::socketcan::nl::CanState::ErrorPassive => CanControllerState::ErrorPassive,
+                    ::socketcan::nl::CanState::BusOff => CanControllerState::BusOff,
+                    ::socketcan::nl::CanState::Stopped => CanControllerState::Stopped,
+                    ::socketcan::nl::CanState::Sleeping => CanControllerState::Sleeping,
+                }),
+                tx_errors: berr.map(|b| b.txerr),
+                rx_errors: berr.map(|b| b.rxerr),
+            })
+        })
+        .await
+        .map_err(CanIoError::backend)??;
+        Ok(Some(state))
     }
 }
 

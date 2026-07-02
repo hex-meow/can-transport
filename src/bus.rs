@@ -23,6 +23,38 @@ pub struct CanCapabilities {
     pub max_dlen: usize,
 }
 
+/// CAN controller fault-confinement state (ISO 11898-1). Ordered from healthy
+/// to dead; the numeric thresholds are the classic REC/TEC boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanControllerState {
+    /// Error counters < 96 — normal operation.
+    ErrorActive,
+    /// A counter reached 96 — still transmitting, worth investigating.
+    ErrorWarning,
+    /// A counter reached 128 — only recessive error flags, ACKs still work.
+    ErrorPassive,
+    /// TEC reached 256 — the controller left the bus.
+    BusOff,
+    /// Controller stopped / not started.
+    Stopped,
+    /// Controller in a sleep state.
+    Sleeping,
+}
+
+/// Best-effort snapshot of controller health, returned by
+/// [`CanBus::bus_state`]. Every field is optional: backends report what they
+/// can and leave the rest `None` (e.g. a driver may expose the state but not
+/// the raw error counters, or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CanBusState {
+    /// Fault-confinement state of the controller.
+    pub state: Option<CanControllerState>,
+    /// Transmit error counter (TEC).
+    pub tx_errors: Option<u16>,
+    /// Receive error counter (REC).
+    pub rx_errors: Option<u16>,
+}
+
 /// A shared CAN bus.
 ///
 /// All methods take `&self`, so a `CanBus` can be wrapped in an `Arc`
@@ -39,6 +71,16 @@ pub trait CanBus: Send + Sync {
 
     /// Static description of what the backend supports.
     fn capabilities(&self) -> CanCapabilities;
+
+    /// Best-effort snapshot of controller state + error counters.
+    ///
+    /// `Ok(None)` means this backend cannot report bus health (the default —
+    /// existing and minimal implementations need no code). Wrapper/decorator
+    /// implementations should forward this explicitly, or they will mask the
+    /// inner backend's support with the default.
+    async fn bus_state(&self) -> Result<Option<CanBusState>, CanIoError> {
+        Ok(None)
+    }
 }
 
 /// A single receive subscription. Drop to unsubscribe.
@@ -53,6 +95,8 @@ pub trait CanRx: Send {
 }
 
 // Blanket impl: `Box<dyn CanBus>` is itself a `CanBus`.
+// NOTE: `bus_state` must be forwarded explicitly — relying on the trait
+// default here would silently mask the inner backend's implementation.
 #[async_trait]
 impl<T: CanBus + ?Sized> CanBus for Box<T> {
     async fn send(&self, frame: CanFrame) -> Result<(), CanIoError> {
@@ -63,6 +107,9 @@ impl<T: CanBus + ?Sized> CanBus for Box<T> {
     }
     fn capabilities(&self) -> CanCapabilities {
         (**self).capabilities()
+    }
+    async fn bus_state(&self) -> Result<Option<CanBusState>, CanIoError> {
+        (**self).bus_state().await
     }
 }
 
@@ -76,5 +123,8 @@ impl<T: CanBus + ?Sized> CanBus for std::sync::Arc<T> {
     }
     fn capabilities(&self) -> CanCapabilities {
         (**self).capabilities()
+    }
+    async fn bus_state(&self) -> Result<Option<CanBusState>, CanIoError> {
+        (**self).bus_state().await
     }
 }
