@@ -299,11 +299,10 @@ fn canframe_to_sc(frame: &CanFrame) -> Result<CanAnyFrame, CanIoError> {
             Ok(CanAnyFrame::Fd(f))
         }
         FrameKind::Remote => {
-            let f = CanRemoteFrame::new_remote(id, frame.dlc())
-                .ok_or(CanIoError::DataTooLong {
-                    got: frame.dlc(),
-                    max: 8,
-                })?;
+            let f = CanRemoteFrame::new_remote(id, frame.dlc()).ok_or(CanIoError::DataTooLong {
+                got: frame.dlc(),
+                max: 8,
+            })?;
             Ok(CanAnyFrame::Remote(f))
         }
     }

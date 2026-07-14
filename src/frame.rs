@@ -120,11 +120,7 @@ impl CanFrame {
     }
 
     /// Build a CAN-FD frame (≤ 64 bytes).
-    pub fn new_fd(
-        id: impl Into<CanId>,
-        payload: &[u8],
-        brs: bool,
-    ) -> Result<Self, CanIoError> {
+    pub fn new_fd(id: impl Into<CanId>, payload: &[u8], brs: bool) -> Result<Self, CanIoError> {
         if payload.len() > MAX_DLEN {
             return Err(CanIoError::DataTooLong {
                 got: payload.len(),

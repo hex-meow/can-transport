@@ -301,11 +301,7 @@ impl GsUsbBus {
     }
 
     /// Open a specific device by USB vendor/product id.
-    pub async fn open_vid_pid(
-        vid: u16,
-        pid: u16,
-        config: GsUsbConfig,
-    ) -> Result<Self, CanIoError> {
+    pub async fn open_vid_pid(vid: u16, pid: u16, config: GsUsbConfig) -> Result<Self, CanIoError> {
         let info = nusb::list_devices()
             .await
             .map_err(CanIoError::backend)?
@@ -331,7 +327,13 @@ impl GsUsbBus {
         let chan = config.channel;
 
         // 1. Tell the device our byte order (little-endian magic 0x0000beef).
-        control_out(&interface, BREQ_HOST_FORMAT, 1, &0x0000_beefu32.to_le_bytes()).await?;
+        control_out(
+            &interface,
+            BREQ_HOST_FORMAT,
+            1,
+            &0x0000_beefu32.to_le_bytes(),
+        )
+        .await?;
 
         // 1b. Probe the device feature word (first u32 of BT_CONST). Gates
         // hardware timestamps and GET_STATE below.
@@ -579,7 +581,10 @@ fn parse_host_frame(
         if buf.len() >= off + 4 {
             Some(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()))
         } else {
-            log::debug!("gs_usb: hw timestamp expected but frame too short ({})", buf.len());
+            log::debug!(
+                "gs_usb: hw timestamp expected but frame too short ({})",
+                buf.len()
+            );
             None
         }
     } else {
@@ -816,7 +821,7 @@ mod tests {
         buf[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
         buf[4..8].copy_from_slice(&0x123u32.to_le_bytes());
         buf[9] = 1; // channel 1
-        // A bus listening on channel 0 must not see channel 1's traffic.
+                    // A bus listening on channel 0 must not see channel 1's traffic.
         assert!(parse_host_frame(&buf, 0, false).is_none());
         // ...but a channel-1 bus does.
         assert!(parse_host_frame(&buf, 1, false).is_some());
@@ -925,7 +930,10 @@ mod tests {
     fn ts_unwrap_handles_32bit_wrap() {
         let (mut last, mut epoch) = (0u32, 0u64);
         assert_eq!(unwrap_ts(&mut last, &mut epoch, 100), 100);
-        assert_eq!(unwrap_ts(&mut last, &mut epoch, 4_000_000_000), 4_000_000_000);
+        assert_eq!(
+            unwrap_ts(&mut last, &mut epoch, 4_000_000_000),
+            4_000_000_000
+        );
         // Counter wrapped: 5 < 4e9 → next epoch.
         assert_eq!(unwrap_ts(&mut last, &mut epoch, 5), (1u64 << 32) | 5);
         // Monotonic across the wrap.
