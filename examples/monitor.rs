@@ -12,7 +12,9 @@ use can_transport::{CanBus, CanFilter};
 async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let iface = std::env::args().nth(1).unwrap_or_else(|| "can0".to_string());
+    let iface = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "can0".to_string());
     println!("Opening {iface} (CAN-FD capable)");
     let bus = SocketCanBus::open(&iface)?;
 
