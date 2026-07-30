@@ -17,7 +17,9 @@ pub mod error;
 pub mod filter;
 pub mod frame;
 
-pub use bus::{CanBus, CanBusState, CanCapabilities, CanControllerState, CanRx};
+pub use bus::{
+    CanBitTiming, CanBus, CanBusState, CanCapabilities, CanControllerState, CanLinkConfig, CanRx,
+};
 pub use error::CanIoError;
 pub use filter::CanFilter;
 pub use frame::{CanFrame, CanId, FrameKind, MAX_DLEN};

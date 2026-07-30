@@ -23,6 +23,36 @@ pub struct CanCapabilities {
     pub max_dlen: usize,
 }
 
+/// Runtime bit-timing information reported by a CAN interface.
+///
+/// Both fields are optional because some backends can recover the sample
+/// point from the applied time segments without knowing the controller clock,
+/// while others may only expose a bitrate.  The sample point uses the same
+/// per-mille representation as Linux CAN netlink (`800` means `0.800`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CanBitTiming {
+    /// Applied bitrate in bits per second.
+    pub bitrate: Option<u32>,
+    /// Applied sample point in per-mille (`800` = `0.800`).
+    pub sample_point_per_mille: Option<u16>,
+}
+
+/// Best-effort snapshot of the configuration currently applied to a link.
+///
+/// This deliberately describes runtime state rather than backend capability:
+/// a SocketCAN backend can support CAN-FD while the selected interface is
+/// currently configured for Classic CAN.  Optional fields mean "not exposed
+/// by this backend/interface", never that a particular policy was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CanLinkConfig {
+    /// Whether CAN-FD is enabled on the link.
+    pub fd_enabled: Option<bool>,
+    /// Arbitration/nominal-phase timing, when observable.
+    pub nominal: Option<CanBitTiming>,
+    /// CAN-FD data-phase timing, when configured and observable.
+    pub data: Option<CanBitTiming>,
+}
+
 /// CAN controller fault-confinement state (ISO 11898-1). Ordered from healthy
 /// to dead; the numeric thresholds are the classic REC/TEC boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +111,17 @@ pub trait CanBus: Send + Sync {
     async fn bus_state(&self) -> Result<Option<CanBusState>, CanIoError> {
         Ok(None)
     }
+
+    /// Best-effort snapshot of the currently applied link configuration.
+    ///
+    /// `Ok(None)` means this backend cannot inspect or reconstruct its runtime
+    /// configuration.  A backend that supports this query should return an
+    /// error when the query itself fails instead of silently substituting
+    /// unknown values.  Wrapper/decorator implementations should forward this
+    /// explicitly, or they will mask support in the inner backend.
+    async fn link_config(&self) -> Result<Option<CanLinkConfig>, CanIoError> {
+        Ok(None)
+    }
 }
 
 /// A single receive subscription. Drop to unsubscribe.
@@ -111,6 +152,9 @@ impl<T: CanBus + ?Sized> CanBus for Box<T> {
     async fn bus_state(&self) -> Result<Option<CanBusState>, CanIoError> {
         (**self).bus_state().await
     }
+    async fn link_config(&self) -> Result<Option<CanLinkConfig>, CanIoError> {
+        (**self).link_config().await
+    }
 }
 
 #[async_trait]
@@ -126,5 +170,8 @@ impl<T: CanBus + ?Sized> CanBus for std::sync::Arc<T> {
     }
     async fn bus_state(&self) -> Result<Option<CanBusState>, CanIoError> {
         (**self).bus_state().await
+    }
+    async fn link_config(&self) -> Result<Option<CanLinkConfig>, CanIoError> {
+        (**self).link_config().await
     }
 }

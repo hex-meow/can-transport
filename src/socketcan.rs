@@ -28,7 +28,9 @@ use socketcan::{
 };
 use tokio::sync::{mpsc, Mutex};
 
-use crate::bus::{CanBus, CanBusState, CanCapabilities, CanControllerState, CanRx};
+use crate::bus::{
+    CanBitTiming, CanBus, CanBusState, CanCapabilities, CanControllerState, CanLinkConfig, CanRx,
+};
 use crate::error::CanIoError;
 use crate::filter::CanFilter;
 use crate::frame::{CanFrame, CanId, FrameKind, MAX_DLEN};
@@ -210,6 +212,44 @@ impl CanBus for SocketCanBus {
         .map_err(CanIoError::backend)??;
         Ok(Some(state))
     }
+
+    async fn link_config(&self) -> Result<Option<CanLinkConfig>, CanIoError> {
+        let iface = self.iface.clone();
+        // Netlink queries are blocking syscalls; keep them off the reactor.
+        // This only reads the current link state and never changes the
+        // interface configuration.
+        let config = tokio::task::spawn_blocking(move || {
+            let nl = ::socketcan::nl::CanInterface::open(&iface).map_err(CanIoError::backend)?;
+            let details = nl.details().map_err(CanIoError::backend)?;
+
+            let fd_enabled = details
+                .can
+                .ctrl_mode
+                .map(|modes| modes.has_mode(::socketcan::CanCtrlMode::Fd))
+                // vcan and some drivers expose the MTU but no CAN ctrl-mode
+                // netlink attribute.  The MTU is the next-best observation.
+                .or_else(|| details.mtu.map(|mtu| mtu == ::socketcan::nl::Mtu::Fd));
+
+            Ok::<CanLinkConfig, CanIoError>(CanLinkConfig {
+                fd_enabled,
+                nominal: details.can.bit_timing.map(netlink_bit_timing),
+                data: details.can.data_bit_timing.map(netlink_bit_timing),
+            })
+        })
+        .await
+        .map_err(CanIoError::backend)??;
+
+        Ok(Some(config))
+    }
+}
+
+fn netlink_bit_timing(timing: ::socketcan::nl::CanBitTiming) -> CanBitTiming {
+    CanBitTiming {
+        bitrate: (timing.bitrate != 0).then_some(timing.bitrate),
+        sample_point_per_mille: u16::try_from(timing.sample_point)
+            .ok()
+            .filter(|point| (1..=1000).contains(point)),
+    }
 }
 
 struct SocketCanRx {
@@ -299,11 +339,10 @@ fn canframe_to_sc(frame: &CanFrame) -> Result<CanAnyFrame, CanIoError> {
             Ok(CanAnyFrame::Fd(f))
         }
         FrameKind::Remote => {
-            let f = CanRemoteFrame::new_remote(id, frame.dlc())
-                .ok_or(CanIoError::DataTooLong {
-                    got: frame.dlc(),
-                    max: 8,
-                })?;
+            let f = CanRemoteFrame::new_remote(id, frame.dlc()).ok_or(CanIoError::DataTooLong {
+                got: frame.dlc(),
+                max: 8,
+            })?;
             Ok(CanAnyFrame::Remote(f))
         }
     }

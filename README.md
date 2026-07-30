@@ -64,14 +64,14 @@ tokio = { version = "1", features = ["full"] }
 
 ```rust
 use can_transport::{CanBus, CanFilter};
-use can_transport::gs_usb::{GsUsbBus, GsUsbConfig};
+use can_transport::gs_usb::{GsUsbBus, GsUsbConfig, GsUsbDataRate};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 1 Mbit nominal / 5 Mbit data, 80 MHz device clock. Matches:
     //   ip link set can0 type can bitrate 1000000 sample-point 0.8 \
     //       dbitrate 5000000 dsample-point 0.75 sjw 5 dsjw 3 fd on
-    let bus = GsUsbBus::open(GsUsbConfig::fd_1m_5m()).await?;
+    let bus = GsUsbBus::open(GsUsbConfig::fd_1m(GsUsbDataRate::Mbps5)).await?;
     let mut rx = bus.subscribe(CanFilter::pass_all_standard()).await?;
     println!("{:?}", rx.recv().await?);
     Ok(())
@@ -86,16 +86,32 @@ cargo run --example gs_usb_monitor --features gs_usb
 
 ### Bit timing
 
-`GsUsbConfig` takes timing in the device's raw segment units (not a
-target bit-rate — a general solver is a TODO). The provided presets
-target an **80 MHz** device clock:
+The standard CAN-FD presets use a 1 Mbit/s nominal phase with sample
+point 0.8. Select the data phase with `GsUsbConfig::fd_1m`:
 
-- `GsUsbConfig::fd_1m_5m()` — CAN-FD, 1 Mbit / 5 Mbit
-- `GsUsbConfig::classic_1m()` — classic CAN, 1 Mbit
+| Data bitrate | Data sample point | Configuration |
+| ------------ | ----------------- | ------------- |
+| 1 Mbit/s | 0.8 | `GsUsbConfig::fd_1m(GsUsbDataRate::Mbps1)` |
+| 2 Mbit/s | 0.8 | `GsUsbConfig::fd_1m(GsUsbDataRate::Mbps2)` |
+| 4 Mbit/s | 0.8 | `GsUsbConfig::fd_1m(GsUsbDataRate::Mbps4)` |
+| 5 Mbit/s | 0.75 | `GsUsbConfig::fd_1m(GsUsbDataRate::Mbps5)` |
 
-For other clocks/rates, set the `nominal` / `data` `GsTiming` fields
-yourself. The kernel's `ip -details link show can0` prints the segment
-values it computed, which you can copy verbatim.
+`GsUsbConfig::fd_1m_5m()` remains available as a compatibility
+shorthand for the 5 Mbit/s entry. `GsUsbConfig::classic_1m()` selects
+Classic CAN at 1 Mbit/s with sample point 0.8.
+
+These standard presets contain exact raw segment values for an **80 MHz**
+CAN controller clock. Before writing the timing, the backend reads
+`BT_CONST`: if the adapter explicitly reports another clock, opening is
+rejected rather than silently applying the wrong bitrate. If `BT_CONST`
+does not provide a clock, the backend cannot verify that assumption and
+continues for compatibility; the reported runtime bitrate is then unknown.
+
+There is no general target-bitrate solver yet. Arbitrary configurations
+remain possible by filling the `nominal` and `data` fields with explicit
+`GsTiming` segment values. The caller is responsible for calculating them
+for the adapter's clock and limits. On Linux, `ip -details link show can0`
+can show the segment values selected by the kernel.
 
 ### Multi-channel adapters
 
@@ -104,7 +120,9 @@ For an adapter with more than one CAN channel, select the channel with
 channel; frames belonging to other channels are filtered out on receive.
 
 ```rust
-let bus = GsUsbBus::open(GsUsbConfig::fd_1m_5m().with_channel(1)).await?;
+let bus = GsUsbBus::open(
+    GsUsbConfig::fd_1m(GsUsbDataRate::Mbps5).with_channel(1),
+).await?;
 ```
 
 Higher-level tools in this workspace expose this as a `gs_usb<channel>`

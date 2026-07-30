@@ -44,7 +44,9 @@ use nusb::transfer::{Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, 
 use nusb::{Device, Interface};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::bus::{CanBus, CanBusState, CanCapabilities, CanControllerState, CanRx};
+use crate::bus::{
+    CanBitTiming, CanBus, CanBusState, CanCapabilities, CanControllerState, CanLinkConfig, CanRx,
+};
 use crate::error::CanIoError;
 use crate::filter::CanFilter;
 use crate::frame::{CanFrame, CanId, FrameKind, MAX_DLEN};
@@ -134,13 +136,92 @@ fn fd_len2dlc(len: usize) -> u8 {
 /// One CAN bit-timing segment set, in the device's raw units. The bit time is
 /// `1 + (prop_seg + phase_seg1) + phase_seg2` time quanta, each `brp / fclk`
 /// seconds long.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GsTiming {
     pub prop_seg: u32,
     pub phase_seg1: u32,
     pub phase_seg2: u32,
     pub sjw: u32,
     pub brp: u32,
+}
+
+const STANDARD_CLOCK_HZ: u32 = 80_000_000;
+const NOMINAL_1M_80MHZ: GsTiming = GsTiming {
+    prop_seg: 31,
+    phase_seg1: 32,
+    phase_seg2: 16,
+    sjw: 5,
+    brp: 1,
+};
+
+/// Standard CAN-FD data-phase rates supported by [`GsUsbConfig::fd_1m`].
+///
+/// These presets target an 80 MHz CAN controller clock.  They intentionally
+/// cover only the production profiles this crate can describe exactly; use
+/// explicit [`GsTiming`] values for other adapters or analyzer use-cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GsUsbDataRate {
+    Mbps1,
+    Mbps2,
+    Mbps4,
+    Mbps5,
+}
+
+impl GsUsbDataRate {
+    /// Data-phase bitrate in bits per second.
+    pub const fn bitrate(self) -> u32 {
+        match self {
+            Self::Mbps1 => 1_000_000,
+            Self::Mbps2 => 2_000_000,
+            Self::Mbps4 => 4_000_000,
+            Self::Mbps5 => 5_000_000,
+        }
+    }
+
+    /// Data-phase sample point in per-mille (`800` = `0.800`).
+    pub const fn sample_point_per_mille(self) -> u16 {
+        match self {
+            Self::Mbps1 | Self::Mbps2 | Self::Mbps4 => 800,
+            Self::Mbps5 => 750,
+        }
+    }
+
+    const fn timing_80mhz(self) -> GsTiming {
+        match self {
+            // 80 MHz / (BRP 2 * 40 TQ) = 1 Mbit/s, SP = 32/40.
+            Self::Mbps1 => GsTiming {
+                prop_seg: 15,
+                phase_seg1: 16,
+                phase_seg2: 8,
+                sjw: 3,
+                brp: 2,
+            },
+            // 80 MHz / (BRP 1 * 40 TQ) = 2 Mbit/s, SP = 32/40.
+            Self::Mbps2 => GsTiming {
+                prop_seg: 15,
+                phase_seg1: 16,
+                phase_seg2: 8,
+                sjw: 3,
+                brp: 1,
+            },
+            // 80 MHz / (BRP 1 * 20 TQ) = 4 Mbit/s, SP = 16/20.
+            Self::Mbps4 => GsTiming {
+                prop_seg: 7,
+                phase_seg1: 8,
+                phase_seg2: 4,
+                sjw: 3,
+                brp: 1,
+            },
+            // 80 MHz / (BRP 1 * 16 TQ) = 5 Mbit/s, SP = 12/16.
+            Self::Mbps5 => GsTiming {
+                prop_seg: 5,
+                phase_seg1: 6,
+                phase_seg2: 4,
+                sjw: 3,
+                brp: 1,
+            },
+        }
+    }
 }
 
 impl GsTiming {
@@ -188,13 +269,7 @@ impl GsUsbConfig {
         Self {
             channel: 0,
             fd: false,
-            nominal: GsTiming {
-                prop_seg: 31,
-                phase_seg1: 32,
-                phase_seg2: 16,
-                sjw: 5,
-                brp: 1,
-            },
+            nominal: NOMINAL_1M_80MHZ,
             data: None,
             listen_only: false,
             loopback: false,
@@ -202,32 +277,28 @@ impl GsUsbConfig {
         }
     }
 
-    /// CAN-FD, 1 Mbit nominal / 5 Mbit data, 80 MHz device clock.
+    /// CAN-FD with 1 Mbit/s nominal timing and a standard selectable data
+    /// rate, for an 80 MHz device clock.
     ///
-    /// Matches `ip link set canX type can bitrate 1000000 sample-point 0.8
-    /// dbitrate 5000000 dsample-point 0.75 sjw 5 dsjw 3 fd on`.
-    pub fn fd_1m_5m() -> Self {
+    /// Nominal timing uses sample point 0.8 and SJW 5.  Data timing uses SJW
+    /// 3; 1/2/4 Mbit/s use sample point 0.8 and 5 Mbit/s uses 0.75.
+    pub fn fd_1m(data_rate: GsUsbDataRate) -> Self {
         Self {
             channel: 0,
             fd: true,
-            nominal: GsTiming {
-                prop_seg: 31,
-                phase_seg1: 32,
-                phase_seg2: 16,
-                sjw: 5,
-                brp: 1,
-            },
-            data: Some(GsTiming {
-                prop_seg: 5,
-                phase_seg1: 6,
-                phase_seg2: 4,
-                sjw: 3,
-                brp: 1,
-            }),
+            nominal: NOMINAL_1M_80MHZ,
+            data: Some(data_rate.timing_80mhz()),
             listen_only: false,
             loopback: false,
             hw_timestamp: false,
         }
+    }
+
+    /// CAN-FD, 1 Mbit/s nominal / 5 Mbit/s data, 80 MHz device clock.
+    ///
+    /// Kept as a compatibility shorthand for [`Self::fd_1m`].
+    pub fn fd_1m_5m() -> Self {
+        Self::fd_1m(GsUsbDataRate::Mbps5)
     }
 
     /// Select which channel of a multi-channel adapter to use (`can0` = 0).
@@ -282,6 +353,9 @@ pub struct GsUsbBus {
     features: u32,
     /// Hardware timestamps were requested *and* the device supports them.
     hw_ts: bool,
+    /// Configuration actually written to the controller, reconstructed with
+    /// the controller clock reported by BT_CONST when available.
+    link_config: CanLinkConfig,
     // Kept alive so the device/interface stay claimed for the bus's lifetime.
     // Also used for on-demand control requests (GET_STATE).
     interface: Interface,
@@ -301,11 +375,7 @@ impl GsUsbBus {
     }
 
     /// Open a specific device by USB vendor/product id.
-    pub async fn open_vid_pid(
-        vid: u16,
-        pid: u16,
-        config: GsUsbConfig,
-    ) -> Result<Self, CanIoError> {
+    pub async fn open_vid_pid(vid: u16, pid: u16, config: GsUsbConfig) -> Result<Self, CanIoError> {
         let info = nusb::list_devices()
             .await
             .map_err(CanIoError::backend)?
@@ -331,17 +401,35 @@ impl GsUsbBus {
         let chan = config.channel;
 
         // 1. Tell the device our byte order (little-endian magic 0x0000beef).
-        control_out(&interface, BREQ_HOST_FORMAT, 1, &0x0000_beefu32.to_le_bytes()).await?;
+        control_out(
+            &interface,
+            BREQ_HOST_FORMAT,
+            1,
+            &0x0000_beefu32.to_le_bytes(),
+        )
+        .await?;
 
-        // 1b. Probe the device feature word (first u32 of BT_CONST). Gates
-        // hardware timestamps and GET_STATE below.
-        let features = match control_in(&interface, BREQ_BT_CONST, chan, BT_CONST_LEN).await {
-            Ok(buf) if buf.len() >= 4 => u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            Ok(_) | Err(_) => {
-                log::warn!("gs_usb: BT_CONST probe failed; assuming no optional features");
-                0
-            }
-        };
+        // 1b. Probe the device feature word and CAN clock from BT_CONST.  The
+        // latter lets link_config report the timing that these raw segment
+        // values actually produce, instead of merely repeating a preset name.
+        let (features, can_clock_hz) =
+            match control_in(&interface, BREQ_BT_CONST, chan, BT_CONST_LEN).await {
+                Ok(buf) if buf.len() >= 8 => (
+                    u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                    nonzero_u32_le(&buf[4..8]),
+                ),
+                Ok(buf) if buf.len() >= 4 => {
+                    log::warn!("gs_usb: short BT_CONST reply; CAN clock is unknown");
+                    (u32::from_le_bytes(buf[0..4].try_into().unwrap()), None)
+                }
+                Ok(_) | Err(_) => {
+                    log::warn!("gs_usb: BT_CONST probe failed; assuming no optional features");
+                    (0, None)
+                }
+            };
+
+        validate_standard_clock(config, can_clock_hz).map_err(CanIoError::backend)?;
+        let link_config = applied_link_config(config, can_clock_hz);
 
         let hw_ts = config.hw_timestamp && (features & FEATURE_HW_TIMESTAMP != 0);
         if config.hw_timestamp && !hw_ts {
@@ -396,6 +484,7 @@ impl GsUsbBus {
             channel: chan,
             features,
             hw_ts,
+            link_config,
             interface,
             _device: device,
         })
@@ -579,7 +668,10 @@ fn parse_host_frame(
         if buf.len() >= off + 4 {
             Some(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()))
         } else {
-            log::debug!("gs_usb: hw timestamp expected but frame too short ({})", buf.len());
+            log::debug!(
+                "gs_usb: hw timestamp expected but frame too short ({})",
+                buf.len()
+            );
             None
         }
     } else {
@@ -682,6 +774,95 @@ impl CanBus for GsUsbBus {
             tx_errors: Some(txerr.min(u16::MAX as u32) as u16),
             rx_errors: Some(rxerr.min(u16::MAX as u32) as u16),
         }))
+    }
+
+    async fn link_config(&self) -> Result<Option<CanLinkConfig>, CanIoError> {
+        Ok(Some(self.link_config))
+    }
+}
+
+fn nonzero_u32_le(bytes: &[u8]) -> Option<u32> {
+    let value = u32::from_le_bytes(bytes.try_into().ok()?);
+    (value != 0).then_some(value)
+}
+
+fn applied_link_config(config: GsUsbConfig, can_clock_hz: Option<u32>) -> CanLinkConfig {
+    CanLinkConfig {
+        fd_enabled: Some(config.fd),
+        nominal: Some(applied_bit_timing(config.nominal, can_clock_hz)),
+        data: if config.fd {
+            config
+                .data
+                .map(|timing| applied_bit_timing(timing, can_clock_hz))
+        } else {
+            None
+        },
+    }
+}
+
+fn validate_standard_clock(
+    config: GsUsbConfig,
+    can_clock_hz: Option<u32>,
+) -> Result<(), ConfigError> {
+    if is_standard_80mhz_profile(config)
+        && can_clock_hz.is_some_and(|clock| clock != STANDARD_CLOCK_HZ)
+    {
+        return Err(ConfigError(
+            "standard gs_usb timing profiles require an 80 MHz CAN clock",
+        ));
+    }
+    Ok(())
+}
+
+fn is_standard_80mhz_profile(config: GsUsbConfig) -> bool {
+    if config.nominal != NOMINAL_1M_80MHZ {
+        return false;
+    }
+    if !config.fd {
+        return config.data.is_none();
+    }
+
+    config.data.is_some_and(|data| {
+        [
+            GsUsbDataRate::Mbps1,
+            GsUsbDataRate::Mbps2,
+            GsUsbDataRate::Mbps4,
+            GsUsbDataRate::Mbps5,
+        ]
+        .into_iter()
+        .any(|rate| data == rate.timing_80mhz())
+    })
+}
+
+fn applied_bit_timing(timing: GsTiming, can_clock_hz: Option<u32>) -> CanBitTiming {
+    let seg1 = timing.prop_seg.checked_add(timing.phase_seg1);
+    let total_tq = seg1
+        .and_then(|seg1| seg1.checked_add(timing.phase_seg2))
+        .and_then(|segments| segments.checked_add(1));
+
+    let bitrate = can_clock_hz.and_then(|clock| {
+        let divisor = u64::from(timing.brp).checked_mul(u64::from(total_tq?))?;
+        if divisor == 0 {
+            return None;
+        }
+        // Hardware timing is rational when the requested combination does
+        // not divide the clock exactly.  Round to the nearest whole bit/s for
+        // this integer snapshot.
+        u32::try_from((u64::from(clock) + divisor / 2) / divisor).ok()
+    });
+
+    let sample_point_per_mille = seg1.and_then(|seg1| {
+        let total = u64::from(total_tq?);
+        if total == 0 {
+            return None;
+        }
+        let sample_tq = u64::from(seg1.checked_add(1)?);
+        u16::try_from((sample_tq * 1000 + total / 2) / total).ok()
+    });
+
+    CanBitTiming {
+        bitrate,
+        sample_point_per_mille,
     }
 }
 
@@ -794,6 +975,130 @@ mod tests {
     use super::*;
 
     #[test]
+    fn standard_fd_profiles_are_exact_at_80mhz() {
+        let profiles = [
+            (
+                GsUsbDataRate::Mbps1,
+                GsTiming {
+                    prop_seg: 15,
+                    phase_seg1: 16,
+                    phase_seg2: 8,
+                    sjw: 3,
+                    brp: 2,
+                },
+                1_000_000,
+                800,
+            ),
+            (
+                GsUsbDataRate::Mbps2,
+                GsTiming {
+                    prop_seg: 15,
+                    phase_seg1: 16,
+                    phase_seg2: 8,
+                    sjw: 3,
+                    brp: 1,
+                },
+                2_000_000,
+                800,
+            ),
+            (
+                GsUsbDataRate::Mbps4,
+                GsTiming {
+                    prop_seg: 7,
+                    phase_seg1: 8,
+                    phase_seg2: 4,
+                    sjw: 3,
+                    brp: 1,
+                },
+                4_000_000,
+                800,
+            ),
+            (
+                GsUsbDataRate::Mbps5,
+                GsTiming {
+                    prop_seg: 5,
+                    phase_seg1: 6,
+                    phase_seg2: 4,
+                    sjw: 3,
+                    brp: 1,
+                },
+                5_000_000,
+                750,
+            ),
+        ];
+
+        for (rate, expected_raw, expected_bitrate, expected_sample_point) in profiles {
+            let config = GsUsbConfig::fd_1m(rate);
+            assert_eq!(config.data, Some(expected_raw));
+            assert_eq!(rate.bitrate(), expected_bitrate);
+            assert_eq!(rate.sample_point_per_mille(), expected_sample_point);
+
+            let applied = applied_link_config(config, Some(80_000_000));
+            assert_eq!(applied.fd_enabled, Some(true));
+            assert_eq!(
+                applied.nominal,
+                Some(CanBitTiming {
+                    bitrate: Some(1_000_000),
+                    sample_point_per_mille: Some(800),
+                })
+            );
+            assert_eq!(
+                applied.data,
+                Some(CanBitTiming {
+                    bitrate: Some(expected_bitrate),
+                    sample_point_per_mille: Some(expected_sample_point),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn gs_usb_snapshot_keeps_clock_independent_fields_when_clock_is_unknown() {
+        let applied = applied_link_config(GsUsbConfig::fd_1m(GsUsbDataRate::Mbps4), None);
+        assert_eq!(applied.fd_enabled, Some(true));
+        assert_eq!(
+            applied.nominal,
+            Some(CanBitTiming {
+                bitrate: None,
+                sample_point_per_mille: Some(800),
+            })
+        );
+        assert_eq!(
+            applied.data,
+            Some(CanBitTiming {
+                bitrate: None,
+                sample_point_per_mille: Some(800),
+            })
+        );
+    }
+
+    #[test]
+    fn classic_profile_does_not_report_data_timing() {
+        let applied = applied_link_config(GsUsbConfig::classic_1m(), Some(80_000_000));
+        assert_eq!(applied.fd_enabled, Some(false));
+        assert_eq!(applied.data, None);
+        assert_eq!(applied.nominal.unwrap().bitrate, Some(1_000_000));
+    }
+
+    #[test]
+    fn standard_profiles_reject_a_known_non_80mhz_clock() {
+        for rate in [
+            GsUsbDataRate::Mbps1,
+            GsUsbDataRate::Mbps2,
+            GsUsbDataRate::Mbps4,
+            GsUsbDataRate::Mbps5,
+        ] {
+            let config = GsUsbConfig::fd_1m(rate);
+            assert!(validate_standard_clock(config, Some(STANDARD_CLOCK_HZ)).is_ok());
+            assert!(validate_standard_clock(config, None).is_ok());
+            assert!(validate_standard_clock(config, Some(60_000_000)).is_err());
+        }
+
+        let classic = GsUsbConfig::classic_1m();
+        assert!(validate_standard_clock(classic, Some(60_000_000)).is_err());
+    }
+
+    #[test]
     fn dlc_len_round_trip() {
         for &len in &[0, 1, 8, 12, 16, 20, 24, 32, 48, 64] {
             assert_eq!(fd_dlc2len(fd_len2dlc(len)), len);
@@ -815,8 +1120,8 @@ mod tests {
         let mut buf = vec![0u8; HDR_LEN + 8];
         buf[0..4].copy_from_slice(&ECHO_ID_RX.to_le_bytes());
         buf[4..8].copy_from_slice(&0x123u32.to_le_bytes());
-        buf[9] = 1; // channel 1
         // A bus listening on channel 0 must not see channel 1's traffic.
+        buf[9] = 1; // channel 1
         assert!(parse_host_frame(&buf, 0, false).is_none());
         // ...but a channel-1 bus does.
         assert!(parse_host_frame(&buf, 1, false).is_some());
@@ -925,7 +1230,10 @@ mod tests {
     fn ts_unwrap_handles_32bit_wrap() {
         let (mut last, mut epoch) = (0u32, 0u64);
         assert_eq!(unwrap_ts(&mut last, &mut epoch, 100), 100);
-        assert_eq!(unwrap_ts(&mut last, &mut epoch, 4_000_000_000), 4_000_000_000);
+        assert_eq!(
+            unwrap_ts(&mut last, &mut epoch, 4_000_000_000),
+            4_000_000_000
+        );
         // Counter wrapped: 5 < 4e9 → next epoch.
         assert_eq!(unwrap_ts(&mut last, &mut epoch, 5), (1u64 << 32) | 5);
         // Monotonic across the wrap.
