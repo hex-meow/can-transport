@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.1.4
+
+### Fixed
+- SocketCAN: a full transmit queue no longer fails the send. The kernel reports
+  a full qdisc as `ENOBUFS`, and tokio's readiness loop does not retry it — it
+  re-arms only on `EWOULDBLOCK`, and write readiness tracks the socket send
+  buffer rather than the device queue, so the socket polls writable while the
+  queue is full. A caller streaming a multi-frame payload saw a hard error
+  partway through a payload it had already half-transmitted. `send` now polls
+  every 1 ms for up to 250 ms before giving up. CAN transmit queues are shallow
+  (`txqueuelen` defaults to 10, and gs_usb adds only ~10 in-flight URBs) and
+  drain at bus rate, so a full queue is back-pressure rather than a fault.
+
+### Changed
+- `repository` now points at `hex-meow/can-transport`. The previous `hexmecha`
+  URL survives only as a GitHub rename redirect.
+
+### Added
+- `LICENSE-MIT` and `LICENSE-APACHE` files, matching the `license` field that
+  earlier releases already declared.
+
+## 0.1.3
+
+### Added
+- `CanBus::link_config()` — best-effort link timing snapshot (`CanLinkConfig`
+  with `fd_enabled` plus nominal and data `CanBitTiming`). SocketCAN reads it
+  over netlink; the default implementation returns `Ok(None)`.
+
 ## 0.1.2
 
 Additive API, no behavior change for existing code paths.
