@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use socketcan::tokio::CanFdSocket;
@@ -38,6 +39,25 @@ use crate::frame::{CanFrame, CanId, FrameKind, MAX_DLEN};
 /// Per-subscriber inbox depth. Frames overflowing this are dropped and
 /// surfaced as `CanIoError::Lagged` on the next `recv` call.
 const SUBSCRIBER_QUEUE: usize = 256;
+
+/// How long to wait between attempts once the transmit queue reports full.
+const TX_BACKPRESSURE_POLL: Duration = Duration::from_millis(1);
+/// How long a full transmit queue is treated as back-pressure rather than a
+/// fault. A CAN device that has not drained a single frame within this long is
+/// not merely busy.
+const TX_BACKPRESSURE_LIMIT: Duration = Duration::from_millis(250);
+
+/// A full transmit queue reports `ENOBUFS`, which is back-pressure, not failure.
+///
+/// Write readiness tracks the socket send buffer, not the device queue, so the
+/// socket polls writable while the qdisc is full and tokio's readiness loop
+/// never retries: it only re-arms on `EWOULDBLOCK`. A caller streaming a
+/// multi-frame payload would see a hard error partway through a frame it had
+/// already half-transmitted. CAN transmit queues are shallow (`txqueuelen` is 10
+/// by default) and drain at bus rate, so waiting is almost always correct.
+fn transmit_queue_full(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOBUFS)
+}
 
 type SubId = u64;
 
@@ -134,24 +154,28 @@ async fn reader_task(socket: Arc<CanFdSocket>, registry: Arc<Registry>) {
 impl CanBus for SocketCanBus {
     async fn send(&self, frame: CanFrame) -> Result<(), CanIoError> {
         let any = canframe_to_sc(&frame)?;
+        if matches!(any, CanAnyFrame::Error(_)) {
+            return Err(CanIoError::InvalidId);
+        }
         // CanFdSocket::write_frame takes &self; concurrent senders are fine.
-        match any {
-            CanAnyFrame::Normal(f) => self
-                .socket
-                .write_frame(&f)
-                .await
-                .map_err(CanIoError::backend),
-            CanAnyFrame::Fd(f) => self
-                .socket
-                .write_frame(&f)
-                .await
-                .map_err(CanIoError::backend),
-            CanAnyFrame::Remote(f) => self
-                .socket
-                .write_frame(&f)
-                .await
-                .map_err(CanIoError::backend),
-            CanAnyFrame::Error(_) => Err(CanIoError::InvalidId),
+        let started = Instant::now();
+        loop {
+            let result = match &any {
+                CanAnyFrame::Normal(f) => self.socket.write_frame(f).await,
+                CanAnyFrame::Fd(f) => self.socket.write_frame(f).await,
+                CanAnyFrame::Remote(f) => self.socket.write_frame(f).await,
+                CanAnyFrame::Error(_) => unreachable!("rejected before the send loop"),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if transmit_queue_full(&error)
+                        && started.elapsed() < TX_BACKPRESSURE_LIMIT =>
+                {
+                    tokio::time::sleep(TX_BACKPRESSURE_POLL).await;
+                }
+                Err(error) => return Err(CanIoError::backend(error)),
+            }
         }
     }
 
